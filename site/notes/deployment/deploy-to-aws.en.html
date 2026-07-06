@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Deploy a Static Site to AWS (S3 + CloudFront + GitHub Actions)</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<header class="site-header">
+  <h1><a href="../../index.html">← My Knowledge Base</a></h1>
+</header>
+
+<main class="note">
+<h1>Deploy a Static Site to AWS (S3 + CloudFront + GitHub Actions)</h1>
+<div class="note-meta">
+  <span class="badge">Deployment</span>
+  <span>2026-07-06</span>
+  <a href="deploy-to-aws.zh.html">中文版</a>
+</div>
+
+<div class="tldr">
+  <span class="label">TL;DR</span>
+  <p>Host the site in a <strong>private S3 bucket</strong>, serve it through <strong>CloudFront</strong> (CDN + HTTPS) via OAC. GitHub Actions authenticates with <strong>OIDC</strong> (no long-lived access keys); every merge to <code>main</code> runs <code>aws s3 sync</code> and invalidates the CloudFront cache. One-time setup, then it's just push-to-deploy.</p>
+</div>
+
+<h2>Architecture</h2>
+<pre><code>GitHub repo ──(merge to main)──▶ GitHub Actions
+                                     │  OIDC assume role (no static keys)
+                                     ▼
+                              aws s3 sync site/ ──▶ S3 bucket (private)
+                                     │                    ▲
+                                     ▼                    │ OAC (CloudFront-only read)
+                       cloudfront create-invalidation     │
+                                                    CloudFront (HTTPS + CDN)
+                                                          ▲
+                                                        Users</code></pre>
+
+<h2>Step 1: Create the S3 bucket</h2>
+<ol>
+  <li>S3 → Create bucket with a globally unique name, e.g. <code>my-knowledge-base-site</code>.</li>
+  <li><strong>Keep "Block all public access" enabled</strong> — CloudFront reads via OAC, the bucket never needs to be public.</li>
+  <li>Do <em>not</em> enable static website hosting (that's only for the public website endpoint; OAC uses the regular REST endpoint).</li>
+</ol>
+
+<h2>Step 2: Create the CloudFront distribution (with OAC)</h2>
+<ol>
+  <li>CloudFront → Create distribution, origin = your S3 bucket.</li>
+  <li>Origin access: <strong>Origin access control settings (OAC)</strong> → create a new OAC.</li>
+  <li>Viewer protocol policy: <strong>Redirect HTTP to HTTPS</strong>.</li>
+  <li><strong>Default root object: <code>index.html</code></strong> (otherwise the root URL returns 403).</li>
+  <li>After creation, CloudFront shows a bucket policy to copy into S3 (Permissions → Bucket policy):</li>
+</ol>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "Service": "cloudfront.amazonaws.com" },
+    "Action": "s3:GetObject",
+    "Resource": "arn:aws:s3:::&lt;BUCKET&gt;/*",
+    "Condition": {
+      "StringEquals": {
+        "AWS:SourceArn": "arn:aws:cloudfront::&lt;ACCOUNT_ID&gt;:distribution/&lt;DIST_ID&gt;"
+      }
+    }
+  }]
+}</code></pre>
+<div class="callout">For a custom domain: add an alternate domain name on the distribution, request an ACM certificate <strong>in us-east-1</strong>, then point DNS at the distribution with a CNAME/alias record.</div>
+
+<h2>Step 3: IAM — GitHub OIDC provider + deploy role</h2>
+<p>OIDC lets GitHub Actions assume a role directly — <strong>no AWS access keys stored in GitHub</strong>, nothing to leak or rotate.</p>
+<h3>3a. Create the OIDC identity provider (once per AWS account)</h3>
+<p>IAM → Identity providers → Add provider:</p>
+<ul>
+  <li>Provider type: OpenID Connect</li>
+  <li>Provider URL: <code>https://token.actions.githubusercontent.com</code></li>
+  <li>Audience: <code>sts.amazonaws.com</code></li>
+</ul>
+<h3>3b. Create the deploy role</h3>
+<p>IAM → Roles → Create role → Web identity, pick the provider above. The trust policy should be <strong>scoped to your repo and the main branch</strong>:</p>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": {
+      "Federated": "arn:aws:iam::&lt;ACCOUNT_ID&gt;:oidc-provider/token.actions.githubusercontent.com"
+    },
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": {
+      "StringEquals": {
+        "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+      },
+      "StringLike": {
+        "token.actions.githubusercontent.com:sub": "repo:&lt;GITHUB_USER&gt;/&lt;REPO&gt;:ref:refs/heads/main"
+      }
+    }
+  }]
+}</code></pre>
+<p>Permissions policy — least privilege, just sync + invalidation:</p>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": "arn:aws:s3:::&lt;BUCKET&gt;"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"],
+      "Resource": "arn:aws:s3:::&lt;BUCKET&gt;/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["cloudfront:CreateInvalidation"],
+      "Resource": "arn:aws:cloudfront::&lt;ACCOUNT_ID&gt;:distribution/&lt;DIST_ID&gt;"
+    }
+  ]
+}</code></pre>
+
+<h2>Step 4: GitHub repo secrets</h2>
+<p>Repo → Settings → Secrets and variables → Actions, add four secrets:</p>
+<table>
+  <tr><th>Secret</th><th>Value</th></tr>
+  <tr><td><code>AWS_DEPLOY_ROLE_ARN</code></td><td>Role ARN from step 3b, e.g. <code>arn:aws:iam::123456789012:role/kb-deploy</code></td></tr>
+  <tr><td><code>AWS_REGION</code></td><td>Bucket region, e.g. <code>ap-southeast-1</code></td></tr>
+  <tr><td><code>S3_BUCKET</code></td><td>Bucket name</td></tr>
+  <tr><td><code>CLOUDFRONT_DISTRIBUTION_ID</code></td><td>e.g. <code>E1A2B3C4D5E6F7</code></td></tr>
+</table>
+
+<h2>Step 5: GitHub Actions workflow</h2>
+<p>Lives at <code>.github/workflows/deploy.yml</code> (already in this repo):</p>
+<pre><code>name: Deploy to AWS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # required for OIDC
+  contents: read
+
+concurrency:
+  group: deploy
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Sync site/ to S3
+        run: aws s3 sync site/ "s3://${{ secrets.S3_BUCKET }}" --delete
+
+      - name: Invalidate CloudFront cache
+        run: &gt;
+          aws cloudfront create-invalidation
+          --distribution-id "${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}"
+          --paths "/*"</code></pre>
+<ul>
+  <li><code>permissions: id-token: write</code> — OIDC fails without it.</li>
+  <li><code>--delete</code> — files removed from the repo are removed from S3 too, keeping them in sync.</li>
+  <li><code>concurrency</code> — rapid consecutive merges cancel the older deploy instead of racing.</li>
+  <li>Invalidations: first 1,000 paths per month are free; <code>/*</code> is the simplest choice for a personal site.</li>
+</ul>
+
+<h2>Verify</h2>
+<ol>
+  <li>Merge a PR into <code>main</code> (or hit <em>Run workflow</em> in the Actions tab).</li>
+  <li>Both steps green in the Actions log.</li>
+  <li>The CloudFront domain (<code>https://dxxxx.cloudfront.net</code>) serves the site; changes appear after the next merge.</li>
+</ol>
+
+<h2>Troubleshooting</h2>
+<table>
+  <tr><th>Symptom</th><th>Cause / fix</th></tr>
+  <tr><td>403 AccessDenied at the root URL</td><td>Default root object not set to <code>index.html</code>, or bucket policy not applied</td></tr>
+  <tr><td><code>Not authorized to perform sts:AssumeRoleWithWebIdentity</code></td><td>Trust policy <code>sub</code> doesn't match (repo/branch typo), or workflow missing <code>id-token: write</code></td></tr>
+  <tr><td>Deploy succeeds but site unchanged</td><td>CloudFront cache not invalidated — check the invalidation step ran</td></tr>
+  <tr><td><code>/foo/</code> doesn't serve its index.html</td><td>Default root object only applies at the root; add a CloudFront Function URI rewrite if needed (this site links full <code>.html</code> paths, so it's unaffected)</td></tr>
+</table>
+
+<h2>References</h2>
+<ul>
+  <li><a href="https://docs.github.com/en/actions/deployment/security-hardening-your-deployments/configuring-openid-connect-in-amazon-web-services">GitHub Docs — Configuring OIDC in AWS</a></li>
+  <li><a href="https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-restricting-access-to-s3.html">AWS — Restricting access to an S3 origin (OAC)</a></li>
+  <li><a href="https://github.com/aws-actions/configure-aws-credentials">aws-actions/configure-aws-credentials</a></li>
+</ul>
+</main>
+
+<footer class="site-footer">
+  <span><a href="../../index.html">← Back to index</a></span>
+</footer>
+</body>
+</html>

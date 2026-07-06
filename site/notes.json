@@ -1,3 +1,16 @@
 {
-  "notes": []
+  "notes": [
+    {
+      "id": "deploy-to-aws",
+      "title": {
+        "zh": "部署靜態網站到 AWS(S3 + CloudFront + GitHub Actions)",
+        "en": "Deploy a Static Site to AWS (S3 + CloudFront + GitHub Actions)"
+      },
+      "category": "deployment",
+      "tags": ["aws", "s3", "cloudfront", "github-actions", "cicd", "oidc"],
+      "date": "2026-07-06",
+      "langs": ["zh", "en"],
+      "path": "notes/deployment/deploy-to-aws"
+    }
+  ]
 }
