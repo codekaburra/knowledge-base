@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Knowledge Base</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<header class="site-header">
+  <h1 data-i18n="siteTitle">我的知識庫</h1>
+  <button id="lang-toggle" class="lang-toggle" title="切換語言 / Switch language">EN</button>
+</header>
+
+<main class="home">
+  <div class="toolbar">
+    <input id="search" type="search" data-i18n-placeholder="searchPlaceholder" placeholder="搜尋筆記…">
+    <div id="categories" class="chips"></div>
+  </div>
+  <div id="note-list" class="note-list"></div>
+  <p id="empty" class="empty" hidden data-i18n="empty">未有符合嘅筆記</p>
+</main>
+
+<footer class="site-footer">
+  <span data-i18n="footer">用 HTML 寫筆記 · S3 + CloudFront · GitHub Actions 自動部署</span>
+</footer>
+
+<script src="assets/app.js"></script>
+</body>
+</html>
