@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>部署靜態網站到 AWS(S3 + CloudFront + GitHub Actions)</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<header class="site-header">
+  <h1><a href="../../index.html">← 我的知識庫</a></h1>
+</header>
+
+<main class="note">
+<h1>部署靜態網站到 AWS(S3 + CloudFront + GitHub Actions)</h1>
+<div class="note-meta">
+  <span class="badge">Deployment</span>
+  <span>2026-07-06</span>
+  <a href="deploy-to-aws.en.html">English version</a>
+</div>
+
+<div class="tldr">
+  <span class="label">TL;DR</span>
+  <p>靜態網站放喺 <strong>private S3 bucket</strong>,前面用 <strong>CloudFront</strong>(CDN + HTTPS)經 OAC 讀取;GitHub Actions 用 <strong>OIDC</strong>(唔使長期 access key)攞臨時 credentials,merge 入 <code>main</code> 就自動 <code>aws s3 sync</code> + invalidate CloudFront cache。一次過設定好之後,以後只需 push code。</p>
+</div>
+
+<h2>架構</h2>
+<pre><code>GitHub repo ──(merge to main)──▶ GitHub Actions
+                                     │  OIDC assume role(冇長期 key)
+                                     ▼
+                              aws s3 sync site/ ──▶ S3 bucket(private)
+                                     │                    ▲
+                                     ▼                    │ OAC(只准 CloudFront 讀)
+                       cloudfront create-invalidation     │
+                                                    CloudFront(HTTPS + CDN)
+                                                          ▲
+                                                        用戶</code></pre>
+
+<h2>Step 1:開 S3 bucket</h2>
+<ol>
+  <li>S3 → Create bucket,名要全球唯一,例如 <code>my-knowledge-base-site</code>。</li>
+  <li><strong>Block all public access 全部保持啟用</strong> — bucket 唔需要 public,CloudFront 會經 OAC 讀。</li>
+  <li>唔使開 static website hosting(嗰個係 public website endpoint 先要,OAC 模式用普通 REST endpoint)。</li>
+</ol>
+
+<h2>Step 2:開 CloudFront distribution(用 OAC)</h2>
+<ol>
+  <li>CloudFront → Create distribution,Origin 揀你個 S3 bucket。</li>
+  <li>Origin access 揀 <strong>Origin access control settings (OAC)</strong> → create new OAC。</li>
+  <li>Viewer protocol policy:<strong>Redirect HTTP to HTTPS</strong>。</li>
+  <li><strong>Default root object:<code>index.html</code></strong>(唔設嘅話開 root 會 403)。</li>
+  <li>建立之後,CloudFront 會提示你 copy 一段 bucket policy 去 S3 — 貼上去(Permissions → Bucket policy),大致係咁:</li>
+</ol>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "Service": "cloudfront.amazonaws.com" },
+    "Action": "s3:GetObject",
+    "Resource": "arn:aws:s3:::&lt;BUCKET&gt;/*",
+    "Condition": {
+      "StringEquals": {
+        "AWS:SourceArn": "arn:aws:cloudfront::&lt;ACCOUNT_ID&gt;:distribution/&lt;DIST_ID&gt;"
+      }
+    }
+  }]
+}</code></pre>
+<div class="callout">要自訂 domain 嘅話:喺 distribution 加 alternate domain name,再喺 ACM(<strong>一定要 us-east-1 region</strong>)申請 certificate,最後喺 DNS 加 CNAME/alias record。</div>
+
+<h2>Step 3:IAM — GitHub OIDC provider + deploy role</h2>
+<p>用 OIDC 俾 GitHub Actions 直接 assume role,<strong>唔使喺 GitHub 存 AWS access key</strong>,冇 key 洩漏、rotate 嘅問題。</p>
+<h3>3a. 開 OIDC identity provider(每個 AWS account 一次)</h3>
+<p>IAM → Identity providers → Add provider:</p>
+<ul>
+  <li>Provider type:OpenID Connect</li>
+  <li>Provider URL:<code>https://token.actions.githubusercontent.com</code></li>
+  <li>Audience:<code>sts.amazonaws.com</code></li>
+</ul>
+<h3>3b. 開 deploy role</h3>
+<p>IAM → Roles → Create role → Web identity,揀啱上面個 provider。Trust policy 要<strong>限定你個 repo 同 main branch</strong>:</p>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": {
+      "Federated": "arn:aws:iam::&lt;ACCOUNT_ID&gt;:oidc-provider/token.actions.githubusercontent.com"
+    },
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": {
+      "StringEquals": {
+        "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+      },
+      "StringLike": {
+        "token.actions.githubusercontent.com:sub": "repo:&lt;GITHUB_USER&gt;/&lt;REPO&gt;:ref:refs/heads/main"
+      }
+    }
+  }]
+}</code></pre>
+<p>Permissions policy 只俾最少權限(sync + invalidation):</p>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": "arn:aws:s3:::&lt;BUCKET&gt;"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"],
+      "Resource": "arn:aws:s3:::&lt;BUCKET&gt;/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["cloudfront:CreateInvalidation"],
+      "Resource": "arn:aws:cloudfront::&lt;ACCOUNT_ID&gt;:distribution/&lt;DIST_ID&gt;"
+    }
+  ]
+}</code></pre>
+
+<h2>Step 4:GitHub repo secrets</h2>
+<p>Repo → Settings → Secrets and variables → Actions,加四個 secret:</p>
+<table>
+  <tr><th>Secret</th><th>值</th></tr>
+  <tr><td><code>AWS_DEPLOY_ROLE_ARN</code></td><td>Step 3b 個 role ARN,例如 <code>arn:aws:iam::123456789012:role/kb-deploy</code></td></tr>
+  <tr><td><code>AWS_REGION</code></td><td>bucket 所在 region,例如 <code>ap-southeast-1</code></td></tr>
+  <tr><td><code>S3_BUCKET</code></td><td>bucket 名</td></tr>
+  <tr><td><code>CLOUDFRONT_DISTRIBUTION_ID</code></td><td>例如 <code>E1A2B3C4D5E6F7</code></td></tr>
+</table>
+
+<h2>Step 5:GitHub Actions workflow</h2>
+<p>放喺 <code>.github/workflows/deploy.yml</code>(呢個 repo 已經有):</p>
+<pre><code>name: Deploy to AWS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # OIDC 必須
+  contents: read
+
+concurrency:
+  group: deploy
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Sync site/ to S3
+        run: aws s3 sync site/ "s3://${{ secrets.S3_BUCKET }}" --delete
+
+      - name: Invalidate CloudFront cache
+        run: &gt;
+          aws cloudfront create-invalidation
+          --distribution-id "${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}"
+          --paths "/*"</code></pre>
+<ul>
+  <li><code>permissions: id-token: write</code> — 冇呢句 OIDC 會失敗。</li>
+  <li><code>--delete</code> — S3 上面已刪除嘅檔案會一齊刪走,S3 同 repo 保持一致。</li>
+  <li><code>concurrency</code> — 短時間內連續 merge,舊嗰個 deploy 會被 cancel,唔會互相衝突。</li>
+  <li>Invalidation:每月首 1,000 個 path 免費,個人網站用 <code>/*</code> 最簡單。</li>
+</ul>
+
+<h2>驗證</h2>
+<ol>
+  <li>Merge 一個 PR 入 <code>main</code>(或者去 Actions tab 撳 <em>Run workflow</em>)。</li>
+  <li>Actions log 兩步都綠色。</li>
+  <li>開 CloudFront domain(<code>https://dxxxx.cloudfront.net</code>)見到網站,改嘢再 merge 會更新。</li>
+</ol>
+
+<h2>常見問題</h2>
+<table>
+  <tr><th>症狀</th><th>原因 / 解法</th></tr>
+  <tr><td>開 root 見 403 AccessDenied</td><td>Default root object 未設做 <code>index.html</code>,或者 bucket policy 未貼</td></tr>
+  <tr><td>Actions 報 <code>Not authorized to perform sts:AssumeRoleWithWebIdentity</code></td><td>Trust policy 個 <code>sub</code> 唔 match(repo 名 / branch 打錯),或者 workflow 冇 <code>id-token: write</code></td></tr>
+  <tr><td>Deploy 成功但網站冇更新</td><td>CloudFront cache 未 invalidate,check 埋 invalidation 嗰步有冇行</td></tr>
+  <tr><td>子目錄 <code>/foo/</code> 開唔到 index.html</td><td>Default root object 只對 root 有效;需要嘅話加 CloudFront Function rewrite URI(本 site 全部用完整 <code>.html</code> path,唔受影響)</td></tr>
+</table>
+
+<h2>參考 References</h2>
+<ul>
+  <li><a href="https://docs.github.com/en/actions/deployment/security-hardening-your-deployments/configuring-openid-connect-in-amazon-web-services">GitHub Docs — Configuring OIDC in AWS</a></li>
+  <li><a href="https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-restricting-access-to-s3.html">AWS — Restricting access to an S3 origin (OAC)</a></li>
+  <li><a href="https://github.com/aws-actions/configure-aws-credentials">aws-actions/configure-aws-credentials</a></li>
+</ul>
+</main>
+
+<footer class="site-footer">
+  <span><a href="../../index.html">← 返回目錄</a></span>
+</footer>
+</body>
+</html>
